@@ -1,0 +1,10 @@
+ib-insync==0.9.86
+pandas==2.1.4
+numpy==1.26.2
+customtkinter==5.2.1
+matplotlib==3.8.2
+yfinance==0.2.32
+ta==0.11.0
+typing-extensions==4.8.0
+tkcalendar==1.6.1
+
