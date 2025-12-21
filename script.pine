@@ -1,0 +1,148 @@
+//@version=6
+strategy("Banknifty EMA SUPERTREND ",
+     overlay = true,
+     pyramiding = 0,
+     initial_capital = 100000,
+     process_orders_on_close = true)
+
+//---------------------------------------------------------
+// TIMEFRAME CHECK - Must run on 10-minute chart
+//---------------------------------------------------------
+if timeframe.period != "10"
+    runtime.error("This strategy must run on 10-minute timeframe only!")
+
+//---------------------------------------------------------
+// INPUTS
+//---------------------------------------------------------
+grpST = "Supertrend Settings (10m)"
+stATR = input.int(55, "ATR Length", group = grpST)
+stFactor = input.float(3.8, "Multiplier", group = grpST)
+
+grpEMA = "EMA Filter Settings"
+emaLen = input.int(200, "EMA Length (1H timeframe)", group = grpEMA)
+
+grpRisk = "Risk Settings"
+slPct = input.float(0.55, "Stop Loss (%)", group = grpRisk)
+tpPct = input.float(3.0, "Target (%)", group = grpRisk)
+
+//---------------------------------------------------------
+// EMA FROM 1H TIMEFRAME - Fetch EMA and close from 1H
+//---------------------------------------------------------
+[ema200_1h, close_1h] = request.security(syminfo.tickerid, "60", [ta.ema(close, emaLen), close], lookahead = barmerge.lookahead_off)
+
+// Detect when 1H candle closes (new 1H bar starts)
+isNew1HCandle = ta.change(time("60")) != 0
+
+// Previous 1H close (to detect crossover)
+prevClose_1h = request.security(syminfo.tickerid, "60", close[1], lookahead = barmerge.lookahead_off)
+prevEma_1h = request.security(syminfo.tickerid, "60", ta.ema(close, emaLen)[1], lookahead = barmerge.lookahead_off)
+
+//---------------------------------------------------------
+// SUPERTREND ON CURRENT TIMEFRAME (10-MIN)
+//---------------------------------------------------------
+[st10, stDir] = ta.supertrend(stFactor, stATR)
+
+//---------------------------------------------------------
+// DETERMINE BULL/BEAR - Instant detection when ST flips
+//---------------------------------------------------------
+stBull = stDir < 0
+stBear = stDir > 0
+
+// Detect ST flip (direction change)
+stBullFlip = stBull and stDir[1] > 0  // Just turned bullish
+stBearFlip = stBear and stDir[1] < 0  // Just turned bearish
+
+//---------------------------------------------------------
+// TRACK IF ALREADY TRADED IN CURRENT ST TREND
+// Reset when ST flips to allow new entry in new trend
+//---------------------------------------------------------
+var bool tradedInBullTrend = false
+var bool tradedInBearTrend = false
+
+// Reset flags when ST flips direction
+if stBullFlip
+    tradedInBullTrend := false
+if stBearFlip
+    tradedInBearTrend := false
+
+//---------------------------------------------------------
+// EMA TREND FILTER FROM 1H TIMEFRAME
+// Check if 1H candle closed above/below EMA
+//---------------------------------------------------------
+// Current 1H candle is above EMA
+emaBull_1h = close_1h > ema200_1h
+emaBear_1h = close_1h < ema200_1h
+
+// Detect when 1H candle JUST closed above EMA (immediate signal trigger)
+// This happens when: current close > EMA AND previous close was <= EMA (actual crossover)
+// Note: Removed isNew1HCandle to prevent reset on every new candle - only reset on actual crossover
+emaBullCross_1h = emaBull_1h and (prevClose_1h <= prevEma_1h)
+emaBearCross_1h = emaBear_1h and (prevClose_1h >= prevEma_1h)
+
+// Reset trade flags when 1H EMA crossover happens within same ST trend
+// Only reset on actual crossover, not on every new candle
+if stBull and emaBullCross_1h
+    tradedInBullTrend := false
+if stBear and emaBearCross_1h
+    tradedInBearTrend := false
+
+//---------------------------------------------------------
+// FINAL SIGNAL CONDITIONS - IMMEDIATE TRIGGER
+// Buy signal triggers IMMEDIATELY when:
+// 1. ST flips green AND 1H candle is above EMA, OR
+// 2. ST is green AND 1H candle just closed above EMA (on new 1H candle start)
+//---------------------------------------------------------
+buyCond  = strategy.position_size == 0 and stBull and emaBull_1h and not tradedInBullTrend and (stBullFlip or emaBullCross_1h)
+sellCond = strategy.position_size == 0 and stBear and emaBear_1h and not tradedInBearTrend and (stBearFlip or emaBearCross_1h)
+
+//---------------------------------------------------------
+// ENTRY EXECUTION
+//---------------------------------------------------------
+if buyCond
+    strategy.entry("BUY", strategy.long)
+    tradedInBullTrend := true
+
+if sellCond
+    strategy.entry("SELL", strategy.short)
+    tradedInBearTrend := true
+
+//---------------------------------------------------------
+// FIXED STOP LOSS & TARGET (NO REPAINT)
+//---------------------------------------------------------
+if strategy.position_size > 0  // LONG
+    longSL = strategy.position_avg_price * (1 - slPct / 100)
+    longTP = strategy.position_avg_price * (1 + tpPct / 100)
+    strategy.exit("BUY EXIT", "BUY", stop = longSL, limit = longTP)
+
+if strategy.position_size < 0  // SHORT
+    shortSL = strategy.position_avg_price * (1 + slPct / 100)
+    shortTP = strategy.position_avg_price * (1 - tpPct / 100)
+    strategy.exit("SELL EXIT", "SELL", stop = shortSL, limit = shortTP)
+
+//---------------------------------------------------------
+// FORCE EXIT WHEN SUPERTREND FLIPS (with confirmation)
+// Exit only when ST is bearish/bullish for 2 consecutive bars to avoid premature exits
+// This prevents exit on temporary price drops while ST is still green
+// TP/SL exit (line 112-120) will still work normally
+//---------------------------------------------------------
+// Exit LONG when ST is bearish for 2 consecutive bars (confirmed flip)
+// Current bar bearish AND previous bar was also bearish
+if strategy.position_size > 0 and stBear and stDir[1] > 0
+    strategy.close("BUY", comment = "ST Flip Exit")
+
+// Exit SHORT when ST is bullish for 2 consecutive bars (confirmed flip)
+// Current bar bullish AND previous bar was also bullish
+if strategy.position_size < 0 and stBull and stDir[1] < 0
+    strategy.close("SELL", comment = "ST Flip Exit")
+
+//---------------------------------------------------------
+// PLOTS
+//---------------------------------------------------------
+plot(ema200_1h, color = color.yellow, linewidth = 2, title = "EMA 200 (1H)")
+
+// Plot ST line; color green when bullish, red when bearish
+plot(st10, color = stBull ? color.rgb(69, 211, 8) : color.rgb(230, 25, 35), linewidth = 2, title = "Supertrend 10m")
+
+// Optional: show small markers
+// plotshape(buyCond, title="BuySignal", style=shape.triangleup, location=location.belowbar, size=size.tiny, color=color.green)
+// plotshape(sellCond, title="SellSignal", style=shape.triangledown, location=location.abovebar, size=size.tiny, color=color.red)

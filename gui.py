@@ -4,6 +4,8 @@ CustomTkinter GUI for Trading Bot
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import ttk
+import os
+import re
 import threading
 import pandas as pd
 from datetime import datetime, timedelta
@@ -22,10 +24,10 @@ except ImportError:
 from ibkr_connection import IBKRConnection
 from strategy import TradingStrategy
 from backtest import BacktestEngine
-from risk_management import RiskManager
 from trade_journal import TradeJournal
 from performance_analytics import PerformanceAnalytics
 from notifications import NotificationManager
+from data_cache import DataCache
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -53,12 +55,13 @@ class TradingBotGUI:
         self.backtest_cancelled = False
         self.contract = None
         self.market_data_subscribed = False
+        self.market_data_ticker = None
         
         # Advanced components
-        self.risk_manager = RiskManager()
         self.trade_journal = TradeJournal()
         self.performance_analytics = PerformanceAnalytics()
         self.notifications = NotificationManager()
+        self.data_cache = DataCache()  # CSV data caching for offline backtest
         
         # Data storage
         self.df_1h = None
@@ -73,9 +76,9 @@ class TradingBotGUI:
     def setup_ui(self):
         """Setup the user interface"""
         # ===== TOP BAR: Connection + Controls =====
-        top_bar = ctk.CTkFrame(self.root, height=120)
+        top_bar = ctk.CTkFrame(self.root, height=160)
         top_bar.pack(fill="x", padx=10, pady=(10, 5))
-        top_bar.pack_propagate(False)
+        # top_bar.pack_propagate(False)  # Commented out to allow buttons to be visible
         
         self.setup_top_bar(top_bar)
         
@@ -94,7 +97,7 @@ class TradingBotGUI:
         
         # Parameters only in sidebar
         self.setup_strategy_panel(sidebar_scroll)
-        self.setup_risk_panel(sidebar_scroll)
+        # Risk Management panel removed - using simple contract quantity parameter
         
         # Right panel - Main content
         right_panel = ctk.CTkFrame(main_frame)
@@ -161,9 +164,10 @@ class TradingBotGUI:
         bt_row1 = ctk.CTkFrame(ctrl_frame, fg_color="transparent")
         bt_row1.pack(fill="x", pady=2)
         
-        self.data_source_var = ctk.StringVar(value="delayed")
-        ctk.CTkRadioButton(bt_row1, text="Delayed", variable=self.data_source_var, value="delayed", width=70).pack(side="left")
-        ctk.CTkRadioButton(bt_row1, text="Realtime", variable=self.data_source_var, value="realtime", width=80).pack(side="left")
+        self.data_source_var = ctk.StringVar(value="csv")  # Default to CSV
+        ctk.CTkRadioButton(bt_row1, text="CSV", variable=self.data_source_var, value="csv", width=50).pack(side="left")
+        ctk.CTkRadioButton(bt_row1, text="Delayed", variable=self.data_source_var, value="delayed", width=65).pack(side="left")
+        ctk.CTkRadioButton(bt_row1, text="Live", variable=self.data_source_var, value="realtime", width=50).pack(side="left")
         
         # Backtest row 2: Date range
         bt_row2 = ctk.CTkFrame(ctrl_frame, fg_color="transparent")
@@ -233,28 +237,36 @@ class TradingBotGUI:
             default_to = datetime.now()
             self.backtest_to_date.insert(0, default_to.strftime("%Y%m%d"))
         
-        # Backtest row 3: Buttons
+        # Backtest row 3: Download + Backtest buttons
         bt_row3 = ctk.CTkFrame(ctrl_frame, fg_color="transparent")
         bt_row3.pack(fill="x", pady=2)
         
-        self.backtest_btn = ctk.CTkButton(bt_row3, text="▶ Start Backtest", command=self.run_backtest,
-                                           fg_color="#FF8C00", hover_color="#FF6600", width=100, height=28)
+        self.download_btn = ctk.CTkButton(bt_row3, text="⬇ Download", command=self.download_data,
+                                           fg_color="#17a2b8", hover_color="#138496", width=85, height=28)
+        self.download_btn.pack(side="left", padx=2)
+        
+        self.backtest_btn = ctk.CTkButton(bt_row3, text="▶ Backtest", command=self.run_backtest_from_cache,
+                                           fg_color="#FF8C00", hover_color="#FF6600", width=80, height=28)
         self.backtest_btn.pack(side="left", padx=2)
         
-        self.stop_backtest_btn = ctk.CTkButton(bt_row3, text="⏹ Stop", command=self.stop_backtest,
-                                                fg_color="#dc3545", hover_color="#c82333", width=70, height=28, state="disabled")
+        self.stop_backtest_btn = ctk.CTkButton(bt_row3, text="⏹", command=self.stop_backtest,
+                                                fg_color="#6c757d", hover_color="#5a6268", width=30, height=28, state="disabled")
         self.stop_backtest_btn.pack(side="left", padx=2)
+        
+        # Download status
+        self.download_status = ctk.CTkLabel(ctrl_frame, text="No data", text_color="#888888", font=("Arial", 9))
+        self.download_status.pack(anchor="w")
         
         # Live trading row
         live_row = ctk.CTkFrame(ctrl_frame, fg_color="transparent")
         live_row.pack(fill="x", pady=2)
         
-        self.start_trading_btn = ctk.CTkButton(live_row, text="▶ Start Live", command=self.start_trading,
-                                                fg_color="#28a745", hover_color="#218838", width=90, height=28)
+        self.start_trading_btn = ctk.CTkButton(live_row, text="▶ Live", command=self.start_trading,
+                                                fg_color="#28a745", hover_color="#218838", width=65, height=28)
         self.start_trading_btn.pack(side="left", padx=2)
         
         self.stop_trading_btn = ctk.CTkButton(live_row, text="⏹ Stop", command=self.stop_trading,
-                                               fg_color="#dc3545", hover_color="#c82333", width=70, height=28, state="disabled")
+                                               fg_color="#dc3545", hover_color="#c82333", width=65, height=28, state="disabled")
         self.stop_trading_btn.pack(side="left", padx=2)
         
         # Separator
@@ -353,32 +365,32 @@ class TradingBotGUI:
         title = ctk.CTkLabel(strat_frame, text="Strategy Parameters", font=("Arial", 16, "bold"))
         title.pack(pady=10)
         
-        # SuperTrend ATR Period (Client spec: 10)
+        # SuperTrend ATR Period (script.pine default: 55)
         st_atr_label = ctk.CTkLabel(strat_frame, text="SuperTrend ATR Period:")
         st_atr_label.pack(anchor="w", padx=10)
         self.st_atr_entry = ctk.CTkEntry(strat_frame, width=200)
-        self.st_atr_entry.insert(0, "10")
+        self.st_atr_entry.insert(0, "55")
         self.st_atr_entry.pack(padx=10, pady=5)
         
-        # SuperTrend Multiplier (Client spec: 3)
+        # SuperTrend Multiplier (script.pine default: 3.8)
         st_mult_label = ctk.CTkLabel(strat_frame, text="SuperTrend Multiplier:")
         st_mult_label.pack(anchor="w", padx=10)
         self.st_mult_entry = ctk.CTkEntry(strat_frame, width=200)
-        self.st_mult_entry.insert(0, "3.0")
+        self.st_mult_entry.insert(0, "3.8")
         self.st_mult_entry.pack(padx=10, pady=5)
         
-        # Take Profit %
+        # Take Profit % (script.pine default: 3.0)
         tp_label = ctk.CTkLabel(strat_frame, text="Take Profit (%):")
         tp_label.pack(anchor="w", padx=10)
         self.tp_entry = ctk.CTkEntry(strat_frame, width=200)
-        self.tp_entry.insert(0, "1.2")
+        self.tp_entry.insert(0, "3.0")
         self.tp_entry.pack(padx=10, pady=5)
         
-        # Stop Loss %
+        # Stop Loss % (script.pine default: 0.55)
         sl_label = ctk.CTkLabel(strat_frame, text="Stop Loss (%):")
         sl_label.pack(anchor="w", padx=10)
         self.sl_entry = ctk.CTkEntry(strat_frame, width=200)
-        self.sl_entry.insert(0, "0.4")
+        self.sl_entry.insert(0, "0.55")
         self.sl_entry.pack(padx=10, pady=5)
         
         # Contract Quantity
@@ -388,6 +400,13 @@ class TradingBotGUI:
         self.quantity_entry.insert(0, "1")
         self.quantity_entry.pack(padx=10, pady=5)
         
+        # Initial Capital (for backtest only)
+        capital_label = ctk.CTkLabel(strat_frame, text="Initial Capital ($) - Backtest:")
+        capital_label.pack(anchor="w", padx=10)
+        self.initial_capital_entry = ctk.CTkEntry(strat_frame, width=200)
+        self.initial_capital_entry.insert(0, "100000")
+        self.initial_capital_entry.pack(padx=10, pady=5)
+        
         # Update button
         update_btn = ctk.CTkButton(
             strat_frame,
@@ -396,55 +415,64 @@ class TradingBotGUI:
         )
         update_btn.pack(pady=10)
     
-    def setup_risk_panel(self, parent):
-        """Setup risk management panel"""
-        risk_frame = ctk.CTkFrame(parent)
-        risk_frame.pack(fill="x", padx=10, pady=10)
-        
-        title = ctk.CTkLabel(risk_frame, text="Risk Management", font=("Arial", 16, "bold"))
-        title.pack(pady=10)
-        
-        # Initial Capital
-        capital_label = ctk.CTkLabel(risk_frame, text="Initial Capital ($):")
-        capital_label.pack(anchor="w", padx=10)
-        self.initial_capital_entry = ctk.CTkEntry(risk_frame, width=200)
-        self.initial_capital_entry.insert(0, "100000")
-        self.initial_capital_entry.pack(padx=10, pady=5)
-        
-        # Risk per trade %
-        risk_label = ctk.CTkLabel(risk_frame, text="Risk per Trade (%):")
-        risk_label.pack(anchor="w", padx=10)
-        self.risk_per_trade_entry = ctk.CTkEntry(risk_frame, width=200)
-        self.risk_per_trade_entry.insert(0, "1.0")
-        self.risk_per_trade_entry.pack(padx=10, pady=5)
-        
-        # Max daily loss %
-        max_loss_label = ctk.CTkLabel(risk_frame, text="Max Daily Loss (%):")
-        max_loss_label.pack(anchor="w", padx=10)
-        self.max_daily_loss_entry = ctk.CTkEntry(risk_frame, width=200)
-        self.max_daily_loss_entry.insert(0, "5.0")
-        self.max_daily_loss_entry.pack(padx=10, pady=5)
-        
-        # Risk metrics display
-        self.risk_metrics_label = ctk.CTkLabel(
-            risk_frame,
-            text="Risk: OK | Capital: $100,000",
-            font=("Arial", 11),
-            text_color="green"
-        )
-        self.risk_metrics_label.pack(pady=10)
+    # Risk Management panel removed - using simple contract quantity parameter instead
+    # def setup_risk_panel(self, parent):
+    #     """Setup risk management panel - REMOVED"""
+    #     pass
     
     def setup_control_panel(self, parent):
-        """Setup trading control panel"""
+        """Setup trading control panel with separate download and backtest buttons"""
         control_frame = ctk.CTkFrame(parent)
         control_frame.pack(fill="x", padx=10, pady=10)
         
         title = ctk.CTkLabel(control_frame, text="Trading Controls", font=("Arial", 16, "bold"))
         title.pack(pady=10)
         
-        # ===== BACKTEST SECTION =====
-        backtest_label = ctk.CTkLabel(control_frame, text="Backtest Settings:", font=("Arial", 12, "bold"))
-        backtest_label.pack(anchor="w", padx=10, pady=(5,0))
+        # ===== DATA DOWNLOAD SECTION =====
+        download_label = ctk.CTkLabel(control_frame, text="📥 Data Download:", font=("Arial", 12, "bold"))
+        download_label.pack(anchor="w", padx=10, pady=(5,0))
+        
+        # Date Range Frame
+        date_frame = ctk.CTkFrame(control_frame, fg_color="transparent")
+        date_frame.pack(fill="x", padx=10, pady=5)
+        
+        # From Date
+        from_label = ctk.CTkLabel(date_frame, text="From:", width=40)
+        from_label.pack(side="left", padx=2)
+        
+        if CALENDAR_AVAILABLE:
+            self.download_from_date = DateEntry(
+                date_frame, 
+                width=10, 
+                background='#1f538d',
+                foreground='white',
+                date_pattern='yyyy-mm-dd'
+            )
+            # Default: 7 days ago
+            default_from = datetime.now() - timedelta(days=7)
+            self.download_from_date.set_date(default_from.date())
+        else:
+            self.download_from_date = ctk.CTkEntry(date_frame, width=90, placeholder_text="YYYYMMDD")
+            self.download_from_date.insert(0, (datetime.now() - timedelta(days=7)).strftime("%Y%m%d"))
+        self.download_from_date.pack(side="left", padx=2)
+        
+        # To Date
+        to_label = ctk.CTkLabel(date_frame, text="To:", width=25)
+        to_label.pack(side="left", padx=2)
+        
+        if CALENDAR_AVAILABLE:
+            self.download_to_date = DateEntry(
+                date_frame, 
+                width=10, 
+                background='#1f538d',
+                foreground='white',
+                date_pattern='yyyy-mm-dd'
+            )
+            self.download_to_date.set_date(datetime.now().date())
+        else:
+            self.download_to_date = ctk.CTkEntry(date_frame, width=90, placeholder_text="YYYYMMDD")
+            self.download_to_date.insert(0, datetime.now().strftime("%Y%m%d"))
+        self.download_to_date.pack(side="left", padx=2)
         
         # Data Source Option
         data_source_frame = ctk.CTkFrame(control_frame, fg_color="transparent")
@@ -454,9 +482,10 @@ class TradingBotGUI:
         
         delayed_radio = ctk.CTkRadioButton(
             data_source_frame, 
-            text="Delayed Data (Free)", 
+            text="Delayed (Free)", 
             variable=self.data_source_var, 
-            value="delayed"
+            value="delayed",
+            font=("Arial", 11)
         )
         delayed_radio.pack(side="left", padx=5)
         
@@ -464,88 +493,175 @@ class TradingBotGUI:
             data_source_frame, 
             text="Real-time", 
             variable=self.data_source_var, 
-            value="realtime"
+            value="realtime",
+            font=("Arial", 11)
         )
         realtime_radio.pack(side="left", padx=5)
         
-        # Backtest Duration
-        duration_label = ctk.CTkLabel(control_frame, text="Duration (Days):")
-        duration_label.pack(anchor="w", padx=10)
-        self.backtest_duration_entry = ctk.CTkEntry(control_frame, width=200)
-        self.backtest_duration_entry.insert(0, "30")
-        self.backtest_duration_entry.pack(padx=10, pady=2)
-        
-        # Backtest button
-        backtest_btn = ctk.CTkButton(
+        # Download Button
+        self.download_btn = ctk.CTkButton(
             control_frame,
-            text="▶ Run Backtest",
-            command=self.run_backtest,
-            fg_color="#FF8C00",
-            hover_color="#FF6600"
+            text="⬇️ Download Data",
+            command=self.download_data,
+            fg_color="#17a2b8",
+            hover_color="#138496",
+            height=35
         )
-        backtest_btn.pack(pady=8, fill="x", padx=10)
+        self.download_btn.pack(pady=5, fill="x", padx=10)
+        
+        # Download Status
+        self.download_status = ctk.CTkLabel(
+            control_frame, 
+            text="No data downloaded", 
+            text_color="#888888",
+            font=("Arial", 10)
+        )
+        self.download_status.pack(pady=2)
+        
+        # ===== BACKTEST SECTION =====
+        backtest_label = ctk.CTkLabel(control_frame, text="📊 Backtest:", font=("Arial", 12, "bold"))
+        backtest_label.pack(anchor="w", padx=10, pady=(10,0))
+        
+        # Backtest buttons frame
+        backtest_btn_frame = ctk.CTkFrame(control_frame, fg_color="transparent")
+        backtest_btn_frame.pack(fill="x", padx=10, pady=5)
+        
+        # Start Backtest button
+        self.backtest_btn = ctk.CTkButton(
+            backtest_btn_frame,
+            text="▶ Start Backtest",
+            command=self.run_backtest_from_cache,
+            fg_color="#FF8C00",
+            hover_color="#FF6600",
+            height=35,
+            width=100
+        )
+        self.backtest_btn.pack(side="left", padx=2, expand=True, fill="x")
+        
+        # Stop Backtest button
+        self.stop_backtest_btn = ctk.CTkButton(
+            backtest_btn_frame,
+            text="⏹ Stop",
+            command=self.stop_backtest,
+            fg_color="#6c757d",
+            hover_color="#5a6268",
+            state="disabled",
+            height=35,
+            width=60
+        )
+        self.stop_backtest_btn.pack(side="left", padx=2)
         
         # ===== LIVE TRADING SECTION =====
-        live_label = ctk.CTkLabel(control_frame, text="Live Trading:", font=("Arial", 12, "bold"))
-        live_label.pack(anchor="w", padx=10, pady=(10,0))
+        live_label = ctk.CTkLabel(control_frame, text="🔴 Live Trading:", font=("Arial", 12, "bold"))
+        live_label.pack(anchor="w", padx=10, pady=(15,0))
+        
+        # Live trading buttons frame
+        live_btn_frame = ctk.CTkFrame(control_frame, fg_color="transparent")
+        live_btn_frame.pack(fill="x", padx=10, pady=5)
         
         # Start Trading button
         self.start_trading_btn = ctk.CTkButton(
-            control_frame,
-            text="▶ Start Live Trading",
+            live_btn_frame,
+            text="▶ Start Live",
             command=self.start_trading,
             fg_color="#28a745",
-            hover_color="#218838"
+            hover_color="#218838",
+            height=35,
+            width=100
         )
-        self.start_trading_btn.pack(pady=5, fill="x", padx=10)
+        self.start_trading_btn.pack(side="left", padx=2, expand=True, fill="x")
         
         # Stop Trading button
         self.stop_trading_btn = ctk.CTkButton(
-            control_frame,
-            text="⏹ Stop Trading",
+            live_btn_frame,
+            text="⏹ Stop",
             command=self.stop_trading,
             fg_color="#dc3545",
             hover_color="#c82333",
-            state="disabled"
+            state="disabled",
+            height=35,
+            width=60
         )
-        self.stop_trading_btn.pack(pady=5, fill="x", padx=10)
+        self.stop_trading_btn.pack(side="left", padx=2)
+        
+        # Legacy support - keep these for compatibility
+        self.backtest_duration_entry = ctk.CTkEntry(control_frame)
+        self.backtest_duration_entry.insert(0, "7")
+        # Hide it but keep for compatibility
+        # self.backtest_duration_entry.pack_forget()
     
     def setup_status_panel(self, parent):
-        """Setup status and position panel"""
-        status_frame = ctk.CTkFrame(parent)
+        """Setup console-style status panel"""
+        status_frame = ctk.CTkFrame(parent, fg_color="#1a1a1a")
         status_frame.pack(fill="both", expand=True, padx=10, pady=10)
         
-        title = ctk.CTkLabel(status_frame, text="Status & Position", font=("Arial", 16, "bold"))
-        title.pack(pady=10)
+        # Console header
+        header_frame = ctk.CTkFrame(status_frame, fg_color="#2d2d2d", height=30)
+        header_frame.pack(fill="x")
+        header_frame.pack_propagate(False)
         
-        # Status text area
-        self.status_text = ctk.CTkTextbox(status_frame, height=200)
-        self.status_text.pack(fill="both", expand=True, padx=10, pady=10)
+        title = ctk.CTkLabel(
+            header_frame, 
+            text="Console Output", 
+            font=("Consolas", 12, "bold"),
+            text_color="#00ff00"
+        )
+        title.pack(side="left", padx=10, pady=5)
+        
+        # Clear button
+        clear_btn = ctk.CTkButton(
+            header_frame,
+            text="Clear",
+            command=self.clear_console,
+            fg_color="#444444",
+            hover_color="#555555",
+            width=60,
+            height=25,
+            font=("Arial", 10)
+        )
+        clear_btn.pack(side="right", padx=10, pady=2)
+        
+        # Console text area - terminal style
+        self.status_text = ctk.CTkTextbox(
+            status_frame, 
+            height=250,
+            fg_color="#0d0d0d",
+            text_color="#00ff00",
+            font=("Consolas", 11),
+            corner_radius=0
+        )
+        self.status_text.pack(fill="both", expand=True, padx=5, pady=5)
+        self.log_status("=== Trading Bot Console ===")
         self.log_status("Application started. Connect to TWS to begin.")
         
-        # Current position
+        # Bottom status bar
+        status_bar = ctk.CTkFrame(status_frame, fg_color="#2d2d2d", height=25)
+        status_bar.pack(fill="x")
+        status_bar.pack_propagate(False)
+        
         self.position_label = ctk.CTkLabel(
-            status_frame, 
+            status_bar, 
             text="Position: None", 
-            font=("Arial", 14)
+            font=("Consolas", 10),
+            text_color="#888888"
         )
-        self.position_label.pack(pady=10)
+        self.position_label.pack(side="left", padx=10, pady=2)
         
-        # Current price
         self.price_label = ctk.CTkLabel(
-            status_frame,
+            status_bar,
             text="Price: --",
-            font=("Arial", 12)
+            font=("Consolas", 10),
+            text_color="#888888"
         )
-        self.price_label.pack(pady=5)
+        self.price_label.pack(side="left", padx=10, pady=2)
         
-        # Account info
         self.account_label = ctk.CTkLabel(
-            status_frame,
+            status_bar,
             text="Account: --",
-            font=("Arial", 12)
+            font=("Consolas", 10),
+            text_color="#888888"
         )
-        self.account_label.pack(pady=5)
+        self.account_label.pack(side="right", padx=10, pady=2)
     
     def setup_tabs_panel(self, parent):
         """Setup tabs for different views"""
@@ -659,6 +775,55 @@ class TradingBotGUI:
         self.status_text.insert("end", f"[{timestamp}] {message}\n")
         self.status_text.see("end")
     
+    def check_tws_client_id(self):
+        """
+        Check TWS settings file for Master API Client ID
+        Returns Client ID if found, None otherwise
+        """
+        try:
+            # Common TWS settings file locations
+            possible_paths = [
+                os.path.join(os.environ.get('APPDATA', ''), 'IB', 'TWS', 'jts.ini'),
+                os.path.join(os.environ.get('LOCALAPPDATA', ''), 'IB', 'TWS', 'jts.ini'),
+                os.path.join('C:', 'Jts', 'jts.ini'),
+                os.path.join(os.path.expanduser('~'), 'Jts', 'jts.ini'),
+            ]
+            
+            # Also check for settings in registry or config files
+            # TWS stores settings in jts.ini file
+            for path in possible_paths:
+                if os.path.exists(path):
+                    try:
+                        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                            content = f.read()
+                            
+                            # Look for Master API Client ID setting
+                            # Common patterns: MasterAPIclientId=2 or masterApiClientId=2
+                            patterns = [
+                                r'MasterAPIclientId\s*=\s*(\d+)',
+                                r'masterApiClientId\s*=\s*(\d+)',
+                                r'MasterApiClientId\s*=\s*(\d+)',
+                                r'masterAPIclientId\s*=\s*(\d+)',
+                            ]
+                            
+                            for pattern in patterns:
+                                match = re.search(pattern, content, re.IGNORECASE)
+                                if match:
+                                    client_id = int(match.group(1))
+                                    logger.info(f"Found TWS Master API Client ID: {client_id} in {path}")
+                                    return client_id
+                    except Exception as e:
+                        logger.debug(f"Error reading TWS settings file {path}: {e}")
+                        continue
+            
+            # If not found in files, return None (no restriction)
+            logger.debug("TWS Master API Client ID not found in settings files")
+            return None
+            
+        except Exception as e:
+            logger.debug(f"Error checking TWS Client ID: {e}")
+            return None
+    
     def connect_ibkr(self):
         """Connect to IBKR TWS"""
         host = self.host_entry.get()
@@ -677,6 +842,22 @@ class TradingBotGUI:
             try:
                 self.log_status(f"Connecting to TWS at {host}:{port} (Client ID: {client_id})...")
                 self.log_status("")
+                
+                # Check TWS settings for Master API Client ID before connection
+                tws_client_id = self.check_tws_client_id()
+                if tws_client_id is not None and tws_client_id != client_id:
+                    self.log_status(f"✗ Client ID mismatch detected!")
+                    self.log_status(f"   - Your Client ID: {client_id}")
+                    self.log_status(f"   - TWS Master API Client ID: {tws_client_id}")
+                    self.log_status("")
+                    self.log_status("Connection rejected. Please:")
+                    self.log_status("1. Change your Client ID to match TWS settings, OR")
+                    self.log_status("2. In TWS: Configure → API → Settings")
+                    self.log_status("   Set 'Master API client ID' to match your Client ID")
+                    self.log_status("")
+                    self.root.after(0, lambda: self.conn_status.configure(text="● Client ID Mismatch", text_color="#dc3545"))
+                    return
+                
                 self.log_status("IMPORTANT: Make sure TWS is running and API is enabled!")
                 self.log_status("In TWS: Configure → API → Settings → Enable ActiveX and Socket Clients")
                 self.log_status("")
@@ -690,19 +871,72 @@ class TradingBotGUI:
                     self.root.after(0, lambda: self.connect_btn.configure(state="disabled"))
                     self.root.after(0, lambda: self.disconnect_btn.configure(state="normal"))
                     
-                    # Get contract
-                    try:
-                        self.log_status("Loading contract...")
-                        self.contract = self.ibkr.get_contract()
-                        contract_info = f"{self.contract.symbol} {self.contract.lastTradeDateOrContractMonth}"
-                        self.log_status(f"✓ Contract loaded: {contract_info}")
-                    except Exception as e:
-                        error_msg = f"⚠ Warning: Could not load contract: {type(e).__name__}: {str(e)}"
-                        self.log_status(error_msg)
-                        self.log_status("You can still run backtests if you have historical data access.")
-                        self.log_status("This might be due to:")
-                        self.log_status("  - Market is closed")
-                        self.log_status("  - Missing market data subscription")
+                    # Auto-detect market data subscription and contract
+                    self.log_status("")
+                    self.log_status("="*50)
+                    self.log_status("AUTO-DETECTING MARKET DATA SUBSCRIPTION...")
+                    self.log_status("="*50)
+                    
+                    detected_symbol, detected_contract = self.ibkr.detect_available_contract()
+                    
+                    if detected_symbol and detected_contract:
+                        self.contract = detected_contract
+                        contract_month = getattr(self.contract, 'lastTradeDateOrContractMonth', 'Continuous')
+                        contract_info = f"{self.contract.symbol} (Continuous Contract)"
+                        if contract_month != 'Continuous':
+                            contract_info += f" - Current: {contract_month}"
+                        self.log_status(f"✓ Contract detected: {contract_info}")
+                        self.log_status("   IBKR will automatically handle contract rollover")
+                        self.log_status("")
+                        self.log_status("✓ Market data subscription confirmed!")
+                        self.log_status("")
+                        self.log_status("="*50)
+                        self.log_status("AUTO-STARTING BACKTEST...")
+                        self.log_status("="*50)
+                        self.log_status("")
+                        
+                        # Auto-start backtest with default date range (last 3 days - smaller for reliability)
+                        from datetime import datetime, timedelta
+                        default_to = datetime.now()
+                        default_from = default_to - timedelta(days=3)  # Default 3 days
+                        
+                        # Update date fields if available
+                        if CALENDAR_AVAILABLE and hasattr(self, 'backtest_from_calendar'):
+                            self.backtest_from_calendar.set_date(default_from.date())
+                            self.backtest_to_calendar.set_date(default_to.date())
+                        elif hasattr(self, 'backtest_from_date'):
+                            self.backtest_from_date.delete(0, "end")
+                            self.backtest_from_date.insert(0, default_from.strftime("%Y%m%d"))
+                            self.backtest_to_date.delete(0, "end")
+                            self.backtest_to_date.insert(0, default_to.strftime("%Y%m%d"))
+                        
+                        # Set data source to CSV (default - no auto-download)
+                        self.data_source_var.set("csv")
+                        
+                        # Ready message - no auto-start
+                        self.log_status("")
+                        self.log_status("Ready! Use the buttons above to:")
+                        self.log_status("  - Click 'Download' to fetch new data from IBKR")
+                        self.log_status("  - Click 'Backtest' to run backtest on cached CSV data")
+                        self.log_status("")
+                    else:
+                        # Fallback to manual contract loading
+                        try:
+                            self.log_status("⚠ Auto-detection failed, trying manual contract load...")
+                            self.contract = self.ibkr.get_contract(use_continuous=True)
+                            contract_month = getattr(self.contract, 'lastTradeDateOrContractMonth', 'Continuous')
+                            contract_info = f"{self.contract.symbol} (Continuous Contract)"
+                            if contract_month != 'Continuous':
+                                contract_info += f" - Current: {contract_month}"
+                            self.log_status(f"✓ Contract loaded: {contract_info}")
+                            self.log_status("   IBKR will automatically handle contract rollover")
+                        except Exception as e:
+                            error_msg = f"⚠ Warning: Could not load contract: {type(e).__name__}: {str(e)}"
+                            self.log_status(error_msg)
+                            self.log_status("You can still run backtests if you have historical data access.")
+                            self.log_status("This might be due to:")
+                            self.log_status("  - Market is closed")
+                            self.log_status("  - Missing market data subscription")
                 else:
                     self.root.after(0, lambda: self.conn_status.configure(text="● Connection Failed", text_color="#dc3545"))
                     self.log_status("✗ Failed to connect to TWS.")
@@ -773,6 +1007,261 @@ class TradingBotGUI:
         self.root.after(0, lambda: self.progress_label.configure(text=text, text_color=color))
         self.root.after(0, lambda: self.quick_status.configure(text=text))
     
+    def clear_console(self):
+        """Clear console output"""
+        self.status_text.delete("1.0", "end")
+        self.log_status("=== Console Cleared ===")
+    
+    def download_data(self):
+        """Download data from IBKR and save to cache"""
+        if not self.ibkr.connected:
+            self.log_status("[ERROR] Please connect to TWS first!")
+            self.update_progress("Not connected", "#dc3545")
+            return
+        
+        def download_thread():
+            try:
+                import time
+                
+                self.log_status("")
+                self.log_status("=" * 50)
+                self.log_status("DOWNLOADING DATA FROM IBKR...")
+                self.log_status("=" * 50)
+                
+                # Get date range from top bar fields
+                if CALENDAR_AVAILABLE and hasattr(self, 'backtest_from_calendar'):
+                    from_date = self.backtest_from_calendar.get_date()
+                    to_date = self.backtest_to_calendar.get_date()
+                    from_date_str = from_date.strftime("%Y%m%d")
+                    to_date_str = to_date.strftime("%Y%m%d")
+                elif hasattr(self, 'backtest_from_date'):
+                    from_date_str = self.backtest_from_date.get()
+                    to_date_str = self.backtest_to_date.get()
+                else:
+                    # Fallback to default 7 days
+                    from datetime import datetime, timedelta
+                    to_date_str = datetime.now().strftime("%Y%m%d")
+                    from_date_str = (datetime.now() - timedelta(days=7)).strftime("%Y%m%d")
+                
+                use_delayed = self.data_source_var.get() == "delayed"
+                
+                self.log_status(f"Date Range: {from_date_str} to {to_date_str}")
+                self.log_status(f"Data Source: {'Delayed' if use_delayed else 'Real-time'}")
+                
+                # Calculate duration
+                from datetime import datetime
+                from_dt = datetime.strptime(from_date_str, "%Y%m%d")
+                to_dt = datetime.strptime(to_date_str, "%Y%m%d")
+                duration_days = (to_dt - from_dt).days + 1
+                
+                if duration_days <= 0:
+                    self.log_status("[ERROR] Invalid date range")
+                    return
+                
+                self.log_status(f"Duration: {duration_days} days")
+                
+                # Get contract
+                if self.contract is None:
+                    self.log_status("Loading contract...")
+                    self.contract = self.ibkr.get_contract(symbol='MNQ')
+                
+                symbol = getattr(self.contract, 'symbol', 'MNQ')
+                
+                # Disable download button
+                self.root.after(0, lambda: self.download_btn.configure(state="disabled", text="Downloading..."))
+                
+                # Download 1H data
+                self.log_status("")
+                self.log_status("[1/2] Downloading 1H data...")
+                start_time = time.time()
+                
+                # Use current time as end date for best results
+                df_1h = self.ibkr.get_1h_data(
+                    self.contract,
+                    duration=f"{duration_days} D",
+                    use_delayed=use_delayed,
+                    end_date=''
+                )
+                elapsed = time.time() - start_time
+                
+                if df_1h is not None and not df_1h.empty:
+                    self.data_cache.save_data(symbol, '1H', df_1h)
+                    self.log_status(f"[OK] 1H: {len(df_1h)} bars saved ({elapsed:.1f}s)")
+                else:
+                    self.log_status(f"[FAIL] 1H data download failed ({elapsed:.1f}s)")
+                
+                # Wait for pacing
+                self.log_status("Waiting 5s (IBKR pacing)...")
+                time.sleep(5)
+                
+                # Download 10M data
+                self.log_status("[2/2] Downloading 10M data...")
+                start_time = time.time()
+                
+                duration_10m = min(duration_days, 30)  # IBKR limit
+                df_10m = self.ibkr.get_10m_data(
+                    self.contract,
+                    duration=f"{duration_10m} D",
+                    use_delayed=use_delayed,
+                    end_date=''
+                )
+                elapsed = time.time() - start_time
+                
+                if df_10m is not None and not df_10m.empty:
+                    self.data_cache.save_data(symbol, '10M', df_10m)
+                    self.log_status(f"[OK] 10M: {len(df_10m)} bars saved ({elapsed:.1f}s)")
+                else:
+                    self.log_status(f"[FAIL] 10M data download failed ({elapsed:.1f}s)")
+                
+                # Update status
+                self.log_status("")
+                self.log_status("=" * 50)
+                
+                # Get final cache info
+                cache_info = self.data_cache.get_cache_info(symbol)
+                if cache_info:
+                    for fname, info in cache_info.items():
+                        self.log_status(f"Cached: {fname} - {info['bars']} bars")
+                
+                self.log_status("DOWNLOAD COMPLETE")
+                self.log_status("=" * 50)
+                
+                # Update download status label
+                h1_bars = len(df_1h) if df_1h is not None and not df_1h.empty else 0
+                m10_bars = len(df_10m) if df_10m is not None and not df_10m.empty else 0
+                status_text = f"Data: {h1_bars} (1H) + {m10_bars} (10M) bars"
+                self.root.after(0, lambda: self.download_status.configure(
+                    text=status_text,
+                    text_color="#28a745" if h1_bars > 0 else "#dc3545"
+                ))
+                
+            except Exception as e:
+                self.log_status(f"[ERROR] {type(e).__name__}: {str(e)}")
+                logger.exception("Download error")
+            finally:
+                # Re-enable download button
+                self.root.after(0, lambda: self.download_btn.configure(state="normal", text="Download Data"))
+        
+        # Run in thread
+        threading.Thread(target=download_thread, daemon=True).start()
+    
+    def run_backtest_from_cache(self):
+        """Run backtest using cached data or download first if needed"""
+        data_source = self.data_source_var.get()
+        
+        self.log_status("")
+        self.log_status("=" * 50)
+        
+        # If CSV selected, load directly from cache
+        if data_source == "csv":
+            self.log_status("RUNNING BACKTEST FROM CSV CACHE...")
+            self.log_status("=" * 50)
+            
+            symbol = 'MNQ'
+            if self.contract:
+                symbol = getattr(self.contract, 'symbol', 'MNQ')
+            
+            self.log_status(f"Loading cached data for {symbol}...")
+            
+            self.df_1h = self.data_cache.load_data(symbol, '1H')
+            self.df_10m = self.data_cache.load_data(symbol, '10M')
+            
+            if self.df_1h.empty or self.df_10m.empty:
+                self.log_status("[ERROR] No cached data found!")
+                self.log_status("Please download data first using the Download button.")
+                self.log_status("Or select 'Delayed' or 'Live' data source.")
+                self.update_progress("No cached data", "#dc3545")
+                return
+            
+            self.log_status(f"[OK] 1H data: {len(self.df_1h)} bars")
+            self.log_status(f"[OK] 10M data: {len(self.df_10m)} bars")
+            
+            # Run backtest
+            self._run_backtest_logic()
+        else:
+            # For Delayed/Live, use old run_backtest method
+            self.log_status("RUNNING BACKTEST (IBKR DATA)...")
+            self.log_status("=" * 50)
+            self.run_backtest()
+    
+    def _run_backtest_logic(self):
+        """Internal method to run backtest on loaded data"""
+        if self.df_1h is None or self.df_1h.empty:
+            self.log_status("[ERROR] No 1H data available!")
+            return
+        
+        if self.df_10m is None or self.df_10m.empty:
+            self.log_status("[ERROR] No 10M data available!")
+            return
+        
+        # Update strategy parameters
+        self.update_strategy_params()
+        
+        self.log_status("")
+        self.log_status("Running strategy analysis...")
+        
+        # Update UI state
+        self.backtest_running = True
+        self.backtest_cancelled = False
+        self.backtest_btn.configure(state="disabled", text="Running...")
+        self.stop_backtest_btn.configure(state="normal")
+        
+        def backtest_worker():
+            try:
+                # Prepare data with indicators using strategy.prepare_data
+                self.log_status("Preparing data and calculating indicators...")
+                df_1h_prepared, df_10m_prepared = self.strategy.prepare_data(
+                    self.df_1h.copy(), 
+                    self.df_10m.copy()
+                )
+                
+                if df_1h_prepared.empty or df_10m_prepared.empty:
+                    self.log_status("[ERROR] Data preparation failed!")
+                    return
+                
+                self.log_status(f"[OK] 1H data prepared: {len(df_1h_prepared)} bars")
+                self.log_status(f"[OK] 10M data prepared: {len(df_10m_prepared)} bars")
+                
+                # Run backtest
+                self.log_status("Generating trade signals...")
+                initial_capital = float(self.initial_capital_entry.get())
+                
+                self.backtest_engine = BacktestEngine(
+                    strategy=self.strategy,
+                    initial_capital=initial_capital
+                )
+                
+                # Run backtest with prepared data (contract_size for MNQ = 2)
+                contract_size = 2  # MNQ contract multiplier
+                results = self.backtest_engine.run_backtest(df_1h_prepared, df_10m_prepared, contract_size=contract_size)
+                
+                if results:
+                    self.backtest_results = results
+                    self.log_status("")
+                    self.log_status("=" * 50)
+                    self.log_status("BACKTEST RESULTS")
+                    self.log_status("=" * 50)
+                    self.log_status(f"Total Trades: {results.get('total_trades', 0)}")
+                    self.log_status(f"Win Rate: {results.get('win_rate', 0):.1f}%")
+                    self.log_status(f"Total P&L: ${results.get('total_pnl', 0):,.2f}")
+                    self.log_status(f"Max Drawdown: {results.get('max_drawdown', 0):.1f}%")
+                    self.log_status("=" * 50)
+                    
+                    self.display_backtest_results()
+                    self.update_progress("Backtest complete", "#28a745")
+                else:
+                    self.log_status("[WARN] No trades generated in backtest")
+                    self.update_progress("No trades", "#ffc107")
+                    
+            except Exception as e:
+                self.log_status(f"[ERROR] Backtest failed: {e}")
+                logger.exception("Backtest error")
+            finally:
+                self.root.after(0, self._reset_backtest_ui)
+        
+        threading.Thread(target=backtest_worker, daemon=True).start()
+
+    
     def run_backtest(self):
         """Run backtest on historical data with custom date range"""
         if not self.ibkr.connected:
@@ -781,10 +1270,17 @@ class TradingBotGUI:
             return
         
         if self.backtest_running:
-            self.log_status("Backtest already running!")
+            self.log_status("⚠ Backtest already running! Please wait for it to complete or stop it first.")
             return
         
         # Get date range from calendar or entry fields
+        # Initialize variables to avoid scope issues
+        from_date_str = None
+        to_date_str = None
+        from_date = None
+        to_date = None
+        duration_days = None
+        
         try:
             if CALENDAR_AVAILABLE and hasattr(self, 'backtest_from_calendar'):
                 # Get dates from calendar widgets (returns date object, convert to datetime)
@@ -796,8 +1292,15 @@ class TradingBotGUI:
                 to_date_str = to_date.strftime("%Y%m%d")
             else:
                 # Fallback to entry fields
-                from_date_str = self.backtest_from_date.get().strip()
-                to_date_str = self.backtest_to_date.get().strip()
+                if hasattr(self, 'backtest_from_date'):
+                    from_date_str = self.backtest_from_date.get().strip()
+                else:
+                    from_date_str = ""
+                    
+                if hasattr(self, 'backtest_to_date'):
+                    to_date_str = self.backtest_to_date.get().strip()
+                else:
+                    to_date_str = ""
                 
                 if from_date_str:
                     from_date = datetime.strptime(from_date_str, "%Y%m%d")
@@ -805,8 +1308,9 @@ class TradingBotGUI:
                     # Default: start of current month
                     from_date = datetime.now().replace(day=1)
                     from_date_str = from_date.strftime("%Y%m%d")
-                    self.backtest_from_date.delete(0, "end")
-                    self.backtest_from_date.insert(0, from_date_str)
+                    if hasattr(self, 'backtest_from_date'):
+                        self.backtest_from_date.delete(0, "end")
+                        self.backtest_from_date.insert(0, from_date_str)
                 
                 if to_date_str:
                     to_date = datetime.strptime(to_date_str, "%Y%m%d")
@@ -814,8 +1318,14 @@ class TradingBotGUI:
                     # Default: today
                     to_date = datetime.now()
                     to_date_str = to_date.strftime("%Y%m%d")
-                    self.backtest_to_date.delete(0, "end")
-                    self.backtest_to_date.insert(0, to_date_str)
+                    if hasattr(self, 'backtest_to_date'):
+                        self.backtest_to_date.delete(0, "end")
+                        self.backtest_to_date.insert(0, to_date_str)
+            
+            # Ensure all variables are set
+            if from_date_str is None or to_date_str is None or from_date is None or to_date is None:
+                self.log_status("✗ Error: Failed to parse dates")
+                return
             
             # Validate dates
             if to_date <= from_date:
@@ -831,9 +1341,18 @@ class TradingBotGUI:
         except ValueError as e:
             self.log_status(f"✗ Error: Invalid date format. Use YYYYMMDD (e.g., 20240101)")
             return
+        except Exception as e:
+            self.log_status(f"✗ Error: Failed to get date range: {e}")
+            logger.exception("Date parsing error")
+            return
         
         data_source = self.data_source_var.get()
         use_delayed = (data_source == "delayed")
+        
+        # Verify all variables are set before starting thread
+        if from_date_str is None or to_date_str is None or duration_days is None:
+            self.log_status("✗ Error: Date variables not properly initialized")
+            return
         
         # Set running state and update UI immediately
         self.backtest_running = True
@@ -844,6 +1363,9 @@ class TradingBotGUI:
         
         # Start thread immediately (non-blocking)
         def backtest_thread():
+            # Declare variables as nonlocal to access from outer scope
+            nonlocal from_date_str, to_date_str, from_date, to_date, duration_days, use_delayed
+            
             # Setup event loop for this thread
             import asyncio
             try:
@@ -866,53 +1388,330 @@ class TradingBotGUI:
                     self.log_status("Backtest cancelled by user")
                     return
                 
-                # Get contract
+                # Get contract (using continuous contract - auto rollover)
                 self.update_progress("📋 Loading contract...", "#888888")
-                contract = self.ibkr.get_contract()
-                self.log_status(f"✓ Contract: {contract.symbol} {contract.lastTradeDateOrContractMonth}")
+                self.log_status("Step 1: Loading contract...")
+                try:
+                    # Use already loaded contract if available to avoid re-qualification
+                    # But check if we need a different contract for the end_date
+                    need_new_contract = False
+                    if self.contract and hasattr(self.contract, 'symbol'):
+                        # Check if existing contract is suitable for end_date
+                        contract_expiry = getattr(self.contract, 'lastTradeDateOrContractMonth', '')
+                        if contract_expiry and len(contract_expiry) >= 6:
+                            try:
+                                from datetime import datetime
+                                end_date_obj = datetime.strptime(to_date_str, "%Y%m%d")
+                                contract_expiry_obj = datetime.strptime(contract_expiry[:6] + "01", "%Y%m%d")
+                                # If contract expires before end_date, need new contract
+                                if contract_expiry_obj < end_date_obj:
+                                    need_new_contract = True
+                            except:
+                                pass
+                        
+                        if not need_new_contract:
+                            contract = self.contract
+                            self.log_status(f"✓ Using existing contract: {contract.symbol}")
+                        else:
+                            self.log_status(f"⚠ Existing contract expires before end_date, loading new contract...")
+                    else:
+                        need_new_contract = True
+                    
+                    if need_new_contract:
+                        self.log_status("Loading new contract for end_date (this may take a few seconds)...")
+                        self.log_status(f"   Target end_date: {to_date_str}")
+                        try:
+                            contract = self.ibkr.get_contract(use_continuous=True, end_date=to_date_str)
+                            self.contract = contract  # Store for future use
+                            self.log_status(f"✓ Contract loaded: {contract.symbol}")
+                        except Exception as e:
+                            self.log_status(f"⚠ Error loading contract with end_date: {e}")
+                            self.log_status("   Falling back to default contract...")
+                            contract = self.ibkr.get_contract(use_continuous=True)
+                            self.contract = contract
+                    else:
+                        contract = self.contract
+                        self.log_status(f"✓ Using existing contract: {contract.symbol}")
+                    
+                    # Verify contract is loaded
+                    if contract is None:
+                        raise ValueError("Contract is None - cannot proceed")
+                    
+                    contract_month = getattr(contract, 'lastTradeDateOrContractMonth', 'Continuous')
+                    self.log_status(f"✓ Contract: {contract.symbol} (Continuous Contract)")
+                    if contract_month != 'Continuous':
+                        self.log_status(f"   Current front month: {contract_month}")
+                    self.log_status("   IBKR will automatically handle rollover for historical data")
+                    self.log_status("")  # Blank line for clarity
+                except Exception as e:
+                    self.log_status(f"✗ Error loading contract: {e}")
+                    logger.exception("Contract loading error")
+                    self.update_progress("✗ Contract load failed", "#dc3545")
+                    self.root.after(0, self._reset_backtest_ui)
+                    return
                 
-                # Format dates for IBKR API (YYYYMMDD HH:MM:SS)
-                end_date_str = f"{to_date_str} 23:59:59"
+                if self.backtest_cancelled:
+                    self.log_status("Backtest cancelled by user")
+                    return
+                
+                # For delayed data, end date cannot be in future
+                # If delayed data and end date is future, use today's date
+                self.log_status("")
+                self.log_status("Step 2: Validating date range...")
+                today = datetime.now().date()
+                
+                # Validate from_date is not in future
+                if from_date.date() > today:
+                    self.log_status(f"✗ Error: From date ({from_date_str}) is in future")
+                    self.log_status("   Please select a past or current date")
+                    self.update_progress("✗ Invalid date range", "#dc3545")
+                    self.root.after(0, self._reset_backtest_ui)
+                    return
+                
+                # Validate to_date is not before from_date
+                if to_date.date() < from_date.date():
+                    self.log_status(f"✗ Error: To date ({to_date_str}) is before from date ({from_date_str})")
+                    self.log_status("   To date must be after or equal to from date")
+                    self.update_progress("✗ Invalid date range", "#dc3545")
+                    self.root.after(0, self._reset_backtest_ui)
+                    return
+                
+                # For delayed data, end date cannot be in future
+                if use_delayed and to_date.date() > today:
+                    self.log_status(f"⚠ Warning: End date ({to_date_str}) is in future")
+                    self.log_status(f"   For delayed data, using today's date: {today.strftime('%Y%m%d')}")
+                    to_date = datetime.now()
+                    to_date_str = today.strftime("%Y%m%d")
+                    # Recalculate duration
+                    duration_days = (to_date.date() - from_date.date()).days
+                    if duration_days <= 0:
+                        self.log_status("✗ Error: Date range invalid after adjustment")
+                        self.update_progress("✗ Invalid date range", "#dc3545")
+                        self.root.after(0, self._reset_backtest_ui)
+                        return
+                
+                # Adjust for weekends - move end date to Friday if weekend
+                weekday = to_date.weekday()  # 0=Monday, 5=Saturday, 6=Sunday
+                if weekday == 5:  # Saturday
+                    to_date = to_date - timedelta(days=1)
+                    to_date_str = to_date.strftime("%Y%m%d")
+                    self.log_status(f"⚠ Saturday detected, adjusting end date to Friday: {to_date_str}")
+                elif weekday == 6:  # Sunday
+                    to_date = to_date - timedelta(days=2)
+                    to_date_str = to_date.strftime("%Y%m%d")
+                    self.log_status(f"⚠ Sunday detected, adjusting end date to Friday: {to_date_str}")
+                
+                # Recalculate duration after weekend adjustment
+                duration_days = (to_date.date() - from_date.date()).days
+                if duration_days <= 0:
+                    self.log_status("✗ Error: Date range invalid after weekend adjustment")
+                    self.update_progress("✗ Invalid date range", "#dc3545")
+                    self.root.after(0, self._reset_backtest_ui)
+                    return
+                
+                # Validate date range is not too large (sanity check)
+                if duration_days > 365:
+                    self.log_status(f"⚠ Warning: Date range is very large ({duration_days} days)")
+                    self.log_status("   This may take a long time and use significant memory")
+                    self.log_status("   Consider using a smaller range for faster results")
+                
+                # Validate minimum date range
+                if duration_days < 1:
+                    self.log_status("✗ Error: Date range must be at least 1 day")
+                    self.update_progress("✗ Invalid date range", "#dc3545")
+                    self.root.after(0, self._reset_backtest_ui)
+                    return
+                
+                # Format dates for IBKR API
+                # Use empty string for current time (recommended for recent data)
+                # Otherwise use YYYYMMDD-HH:MM:SS format
+                if to_date.date() >= datetime.now().date():
+                    end_date_str = ''  # Empty = current time (best for recent data)
+                    self.log_status("Using current time as end date (recommended)")
+                else:
+                    end_date_str = to_date.strftime("%Y%m%d-23:59:59")
                 
                 # Calculate duration strings
                 duration_1h = f"{duration_days} D"
-                duration_10m = f"{min(duration_days, 5)} D"  # 10M limited to 5 days
+                # IBKR allows 10-min bars for up to 30 days
+                duration_10m = f"{min(duration_days, 30)} D"
+                
+                self.log_status(f"✓ Date range validated: {from_date_str} to {to_date_str} ({duration_days} days)")
                 
                 # Fetch data with delayed flag
                 if self.backtest_cancelled:
                     self.log_status("Backtest cancelled by user")
                     return
                 
+                self.log_status("")
+                self.log_status("Step 3: Fetching historical data...")
                 self.update_progress("📊 Fetching 1H data...", "#888888")
                 self.log_status(f"Fetching 1H data ({duration_1h})...")
-                self.df_1h = self.ibkr.get_1h_data(
-                    contract, 
-                    duration=duration_1h, 
-                    use_delayed=use_delayed,
-                    end_date=end_date_str
-                )
+                self.log_status(f"   Data Source: {'Delayed (Free)' if use_delayed else 'Real-time'}")
+                self.log_status(f"   End Date: {end_date_str}")
+                self.log_status(f"   ⏳ Fetching data (usually 5-15 seconds)...")
+                
+                import time
+                start_time = time.time()
+                try:
+                    self.log_status(f"   Requesting 1H data: {duration_1h}...")
+                    self.df_1h = self.ibkr.get_1h_data(
+                        contract, 
+                        duration=duration_1h, 
+                        use_delayed=use_delayed,
+                        end_date=end_date_str
+                    )
+                    elapsed_1h = time.time() - start_time
+                except Exception as e:
+                    elapsed_1h = time.time() - start_time
+                    self.log_status(f"✗ Error fetching 1H data after {elapsed_1h:.1f} seconds: {e}")
+                    logger.exception("1H data fetch error")
+                    self.df_1h = pd.DataFrame()  # Set empty to trigger error handling below
                 
                 if self.backtest_cancelled:
                     self.log_status("Backtest cancelled by user")
                     return
+                
+                if not self.df_1h.empty:
+                    self.log_status(f"✓ 1H data fetched in {elapsed_1h:.1f} seconds ({len(self.df_1h)} bars)")
+                else:
+                    self.log_status(f"✗ 1H data fetch failed after {elapsed_1h:.1f} seconds")
                 
                 self.update_progress("📊 Fetching 10M data...", "#888888")
-                self.log_status(f"Fetching 10M data ({duration_10m})...")
-                self.df_10m = self.ibkr.get_10m_data(
-                    contract, 
-                    duration=duration_10m, 
-                    use_delayed=use_delayed,
-                    end_date=end_date_str
-                )
+                self.log_status(f"   Requesting 10M data: {duration_10m}...")
+                self.log_status(f"   Data Source: {'Delayed (Free)' if use_delayed else 'Real-time'}")
+                self.log_status(f"   End Date: {end_date_str}")
+                self.log_status(f"   ⏳ Fetching data (usually 5-15 seconds)...")
+                
+                start_time = time.time()
+                try:
+                    self.df_10m = self.ibkr.get_10m_data(
+                        contract, 
+                        duration=duration_10m, 
+                        use_delayed=use_delayed,
+                        end_date=end_date_str
+                    )
+                    elapsed_10m = time.time() - start_time
+                except Exception as e:
+                    elapsed_10m = time.time() - start_time
+                    self.log_status(f"✗ Error fetching 10M data after {elapsed_10m:.1f} seconds: {e}")
+                    logger.exception("10M data fetch error")
+                    self.df_10m = pd.DataFrame()  # Set empty to trigger error handling below
+                
+                if not self.df_10m.empty:
+                    self.log_status(f"✓ 10M data fetched in {elapsed_10m:.1f} seconds ({len(self.df_10m)} bars)")
+                else:
+                    self.log_status(f"✗ 10M data fetch failed after {elapsed_10m:.1f} seconds")
                 
                 if self.backtest_cancelled:
                     self.log_status("Backtest cancelled by user")
                     return
                 
-                if self.df_1h.empty or self.df_10m.empty:
-                    self.log_status("✗ Error: Could not fetch historical data")
-                    self.log_status("Check your market data subscription or date range")
-                    self.update_progress("✗ Data fetch failed", "#dc3545")
+                # Validate data before proceeding
+                if self.df_1h is None or self.df_1h.empty:
+                    # TRY LOADING FROM CACHE
+                    self.log_status("")
+                    self.log_status("⚠ IBKR data fetch failed, trying cache...")
+                    try:
+                        symbol = getattr(contract, 'symbol', 'MNQ')
+                        cached_1h = self.data_cache.load_data(symbol, '1H')
+                        if not cached_1h.empty:
+                            self.df_1h = cached_1h
+                            self.log_status(f"✓ Loaded 1H data from cache ({len(self.df_1h)} bars)")
+                        else:
+                            self.log_status("✗ No cached 1H data available")
+                    except Exception as e:
+                        self.log_status(f"✗ Cache load error: {e}")
+                else:
+                    # SAVE SUCCESSFUL FETCH TO CACHE
+                    try:
+                        symbol = getattr(contract, 'symbol', 'MNQ')
+                        self.data_cache.save_data(symbol, '1H', self.df_1h)
+                        self.log_status(f"💾 Saved 1H data to cache for offline use")
+                    except Exception as e:
+                        logger.debug(f"Cache save error: {e}")
+                
+                # Re-check after cache attempt
+                if self.df_1h is None or self.df_1h.empty:
+                    self.log_status("")
+                    self.log_status("✗ ERROR: 1H data is empty or None")
+                    self.log_status("")
+                    self.log_status("Troubleshooting steps:")
+                    self.log_status("1. ✓ Check TWS is connected and running")
+                    self.log_status("2. ✓ Verify market data subscription in TWS")
+                    self.log_status("3. ✓ Check date range is valid (not in future for delayed data)")
+                    self.log_status("4. ✓ Try smaller date range (e.g., 3 days instead of 6)")
+                    self.log_status("5. ✓ Check if market was open during this period")
+                    if use_delayed:
+                        self.log_status("6. ✓ For delayed data, end date must be today or earlier")
+                    else:
+                        self.log_status("6. ✓ For real-time data, ensure subscription is active")
+                    self.log_status("")
+                    self.update_progress("✗ 1H data fetch failed", "#dc3545")
+                    self.root.after(0, self._reset_backtest_ui)
+                    return
+                
+                if self.df_10m is None or self.df_10m.empty:
+                    # TRY LOADING FROM CACHE
+                    self.log_status("")
+                    self.log_status("⚠ IBKR 10M data fetch failed, trying cache...")
+                    try:
+                        symbol = getattr(contract, 'symbol', 'MNQ')
+                        cached_10m = self.data_cache.load_data(symbol, '10M')
+                        if not cached_10m.empty:
+                            self.df_10m = cached_10m
+                            self.log_status(f"✓ Loaded 10M data from cache ({len(self.df_10m)} bars)")
+                        else:
+                            self.log_status("✗ No cached 10M data available")
+                    except Exception as e:
+                        self.log_status(f"✗ Cache load error: {e}")
+                else:
+                    # SAVE SUCCESSFUL FETCH TO CACHE
+                    try:
+                        symbol = getattr(contract, 'symbol', 'MNQ')
+                        self.data_cache.save_data(symbol, '10M', self.df_10m)
+                        self.log_status(f"💾 Saved 10M data to cache for offline use")
+                    except Exception as e:
+                        logger.debug(f"Cache save error: {e}")
+                
+                # Re-check after cache attempt
+                if self.df_10m is None or self.df_10m.empty:
+                    self.log_status("")
+                    self.log_status("✗ ERROR: 10M data is empty or None")
+                    self.log_status("")
+                    self.log_status("Troubleshooting steps:")
+                    self.log_status("1. ✓ Check TWS is connected and running")
+                    self.log_status("2. ✓ Verify market data subscription in TWS")
+                    self.log_status("3. ✓ Check date range is valid (10M data limited to 5 days)")
+                    self.log_status("4. ✓ Try smaller date range (e.g., 3 days instead of 5)")
+                    self.log_status("5. ✓ Check if market was open during this period")
+                    if use_delayed:
+                        self.log_status("6. ✓ For delayed data, end date must be today or earlier")
+                    else:
+                        self.log_status("6. ✓ For real-time data, ensure subscription is active")
+                    self.log_status("")
+                    self.update_progress("✗ 10M data fetch failed", "#dc3545")
+                    self.root.after(0, self._reset_backtest_ui)
+                    return
+                
+                # Additional validation: check minimum data points
+                if len(self.df_1h) < 2:
+                    self.log_status("")
+                    self.log_status("✗ ERROR: Insufficient 1H data (need at least 2 bars)")
+                    self.log_status(f"   Received: {len(self.df_1h)} bars")
+                    self.log_status("   Try increasing the date range")
+                    self.log_status("")
+                    self.update_progress("✗ Insufficient data", "#dc3545")
+                    self.root.after(0, self._reset_backtest_ui)
+                    return
+                
+                if len(self.df_10m) < 2:
+                    self.log_status("")
+                    self.log_status("✗ ERROR: Insufficient 10M data (need at least 2 bars)")
+                    self.log_status(f"   Received: {len(self.df_10m)} bars")
+                    self.log_status("   Try increasing the date range")
+                    self.log_status("")
+                    self.update_progress("✗ Insufficient data", "#dc3545")
                     self.root.after(0, self._reset_backtest_ui)
                     return
                 
@@ -943,13 +1742,61 @@ class TradingBotGUI:
                     self.log_status("Backtest cancelled by user")
                     return
                 
-                self.backtest_results = self.backtest_engine.run_backtest(self.df_1h, self.df_10m)
+                # Run backtest - ensure it always returns a result
+                try:
+                    self.log_status(f"Processing {len(self.df_1h)} bars...")
+                    self.backtest_results = self.backtest_engine.run_backtest(self.df_1h, self.df_10m)
+                    self.log_status(f"✓ Backtest simulation completed")
+                    
+                    # Validate results
+                    if self.backtest_results is None:
+                        self.log_status("⚠ Warning: Backtest returned None, using empty results")
+                        self.backtest_results = {
+                            'total_trades': 0,
+                            'winning_trades': 0,
+                            'losing_trades': 0,
+                            'win_rate': 0,
+                            'total_pnl': 0,
+                            'total_pnl_pct': 0,
+                            'avg_win': 0,
+                            'avg_loss': 0,
+                            'profit_factor': 0,
+                            'max_drawdown': 0,
+                            'final_capital': initial_capital,
+                            'roi': 0,
+                            'trades': pd.DataFrame(),
+                            'equity_curve': pd.DataFrame()
+                        }
+                    else:
+                        self.log_status(f"✓ Backtest results received: {self.backtest_results.get('total_trades', 0)} trades")
+                except Exception as e:
+                    self.log_status(f"✗ Error during backtest execution: {e}")
+                    logger.exception("Backtest execution error")
+                    self.backtest_results = {
+                        'total_trades': 0,
+                        'winning_trades': 0,
+                        'losing_trades': 0,
+                        'win_rate': 0,
+                        'total_pnl': 0,
+                        'total_pnl_pct': 0,
+                        'avg_win': 0,
+                        'avg_loss': 0,
+                        'profit_factor': 0,
+                        'max_drawdown': 0,
+                        'final_capital': initial_capital,
+                        'roi': 0,
+                        'trades': pd.DataFrame(),
+                        'equity_curve': pd.DataFrame()
+                    }
                 
                 if self.backtest_cancelled:
                     self.log_status("Backtest cancelled by user")
                     return
                 
                 # Display results
+                self.log_status("Preparing to display results...")
+                if self.backtest_results and isinstance(self.backtest_results, dict):
+                    self.log_status(f"Results ready: {self.backtest_results.get('total_trades', 0)} trades found")
                 self.root.after(0, self.display_backtest_results)
                 self.root.after(0, self.plot_charts)
                 
@@ -992,13 +1839,26 @@ class TradingBotGUI:
     
     def display_backtest_results(self):
         """Display backtest results"""
-        if not self.backtest_results:
+        if self.backtest_results is None:
+            self.log_status("⚠ No backtest results to display (results is None)")
             return
         
         results = self.backtest_results
-        self.results_text.delete("1.0", "end")
         
-        result_str = f"""
+        # Ensure all required keys exist
+        if not isinstance(results, dict):
+            self.log_status(f"⚠ Invalid backtest results format: {type(results)}")
+            return
+        
+        # Check if results dict is empty (shouldn't happen but check anyway)
+        if not results:
+            self.log_status("⚠ No backtest results to display (empty dict)")
+            return
+        
+        try:
+            self.results_text.delete("1.0", "end")
+            
+            result_str = f"""
 Total Trades: {results['total_trades']}
 Winning Trades: {results['winning_trades']}
 Losing Trades: {results['losing_trades']}
@@ -1011,7 +1871,14 @@ Max Drawdown: {results['max_drawdown']:.2f}%
 Final Capital: ${results['final_capital']:.2f}
 ROI: {results['roi']:.2f}%
 """
-        self.results_text.insert("1.0", result_str)
+            self.results_text.insert("1.0", result_str)
+            self.log_status(f"✓ Results displayed: {results['total_trades']} trades, PnL: ${results['total_pnl']:.2f}")
+        except KeyError as e:
+            self.log_status(f"⚠ Missing key in results: {e}")
+            logger.exception("Error displaying results")
+        except Exception as e:
+            self.log_status(f"⚠ Error displaying results: {e}")
+            logger.exception("Error displaying results")
     
     def plot_charts(self):
         """Plot price chart with indicators"""
@@ -1042,34 +1909,69 @@ ROI: {results['roi']:.2f}%
         self.canvas.draw()
     
     def subscribe_market_data(self):
-        """Subscribe to real-time market data"""
+        """Subscribe to real-time market data
+        
+        Returns:
+            bool: True if subscription successful, False otherwise
+        """
         if not self.contract or not self.ibkr.connected:
-            return
+            return False
         
         try:
-            self.ibkr.ib.reqMktData(self.contract, '', False, False)
+            # Request market data and get ticker object
+            ticker = self.ibkr.ib.reqMktData(self.contract, '', False, False)
+            
+            # Wait a bit to check if subscription is successful
+            import time
+            time.sleep(0.5)
+            
+            # Check if ticker has valid data
+            if ticker is None:
+                self.log_status("⚠ Market data subscription failed - No market data available")
+                self.log_status("   Trading will continue using historical data")
+                return False
+            
             self.market_data_subscribed = True
+            self.market_data_ticker = ticker
             
-            # Set up market data callback
+            # Set up market data callback using ticker's updateEvent
             def on_tickUpdate(ticker):
-                if ticker.last:
-                    self.current_price = ticker.last
-                    self.root.after(0, lambda: self.price_label.configure(text=f"Price: ${ticker.last:.2f}"))
+                try:
+                    if ticker.last and ticker.last > 0:
+                        self.current_price = ticker.last
+                        self.root.after(0, lambda p=ticker.last: self.price_label.configure(text=f"Price: ${p:.2f}"))
+                except Exception as e:
+                    logger.debug(f"Error in ticker update: {e}")
             
-            self.ibkr.ib.tickerUpdateEvent += on_tickUpdate
-            self.log_status("Subscribed to real-time market data")
+            # Subscribe to ticker updates
+            ticker.updateEvent += on_tickUpdate
+            return True
         except Exception as e:
-            self.log_status(f"Error subscribing to market data: {e}")
+            self.log_status(f"⚠ Market data subscription failed: {str(e)}")
+            self.log_status("   Trading will continue using historical data")
+            logger.exception("Market data subscription error")
+            return False
     
-    def unsubscribe_market_data(self):
-        """Unsubscribe from market data"""
+    def unsubscribe_market_data(self, silent=False):
+        """Unsubscribe from market data
+        
+        Args:
+            silent: If True, don't log unsubscribe message
+        """
         if self.contract and self.market_data_subscribed:
             try:
-                self.ibkr.ib.cancelMktData(self.contract)
+                if self.market_data_ticker:
+                    self.ibkr.ib.cancelMktData(self.contract)
+                    self.market_data_ticker = None
+                else:
+                    self.ibkr.ib.cancelMktData(self.contract)
                 self.market_data_subscribed = False
-                self.log_status("Unsubscribed from market data")
+                if not silent:
+                    self.log_status("Unsubscribed from market data")
             except Exception as e:
-                self.log_status(f"Error unsubscribing: {e}")
+                if not silent:
+                    self.log_status(f"Error unsubscribing: {e}")
+                logger.exception("Market data unsubscribe error")
     
     def sync_positions(self):
         """Sync positions with IBKR"""
@@ -1078,9 +1980,14 @@ ROI: {results['roi']:.2f}%
             found_position = False
             
             if positions:
+                # Get contract symbol from current contract or default to MNQ
+                target_symbol = 'MNQ'
+                if self.contract and hasattr(self.contract, 'symbol'):
+                    target_symbol = self.contract.symbol
+                
                 for pos in positions:
-                    # Check if this is our contract (NQ futures)
-                    if hasattr(pos.contract, 'symbol') and pos.contract.symbol == 'NQ':
+                    # Check if this is our contract (MNQ/NQ futures)
+                    if hasattr(pos.contract, 'symbol') and pos.contract.symbol == target_symbol:
                         found_position = True
                         if pos.position > 0:
                             self.strategy.position = 1
@@ -1133,7 +2040,12 @@ ROI: {results['roi']:.2f}%
         
         if not self.contract:
             try:
-                self.contract = self.ibkr.get_contract()
+                self.log_status("Loading contract (Continuous - auto rollover)...")
+                self.contract = self.ibkr.get_contract(use_continuous=True)
+                contract_month = getattr(self.contract, 'lastTradeDateOrContractMonth', 'Continuous')
+                self.log_status(f"✓ Contract: {self.contract.symbol} (Continuous Contract)")
+                if contract_month != 'Continuous':
+                    self.log_status(f"   Current front month: {contract_month}")
             except Exception as e:
                 self.log_status(f"Error getting contract: {e}")
                 return
@@ -1141,10 +2053,14 @@ ROI: {results['roi']:.2f}%
         self.is_trading = True
         self.start_trading_btn.configure(state="disabled")
         self.stop_trading_btn.configure(state="normal")
-        self.log_status("Live trading started...")
         
-        # Subscribe to market data
-        self.subscribe_market_data()
+        # Subscribe to market data (optional - trading works without it)
+        market_data_available = self.subscribe_market_data()
+        
+        if market_data_available:
+            self.log_status("✓ Live trading started with real-time market data")
+        else:
+            self.log_status("✓ Live trading started (using historical data)")
         
         # Sync positions
         self.sync_positions()
@@ -1185,21 +2101,11 @@ ROI: {results['roi']:.2f}%
                     signal, price = self.strategy.check_entry_signal(df_1h, df_10m, current_idx)
                     
                     if signal and self.strategy.position == 0:
-                        # Check risk management
-                        can_trade, reason = self.risk_manager.can_trade()
-                        if not can_trade:
-                            self.log_status(f"Trade blocked by risk management: {reason}")
-                            self.notifications.notify_risk_limit(reason)
-                            import time
-                            time.sleep(60)
-                            continue
+                        # Use contract quantity parameter (simple risk management)
+                        position_size = self.contract_quantity
                         
-                        # Calculate position size based on risk
-                        sl_price = price * (1 - self.strategy.sl_percent / 100) if signal == 'BUY' else price * (1 + self.strategy.sl_percent / 100)
-                        position_size = self.risk_manager.calculate_position_size(price, sl_price, contract_multiplier=20)
-                        
-                        if position_size == 0:
-                            self.log_status("Position size calculated as 0, skipping trade")
+                        if position_size <= 0:
+                            self.log_status("Contract quantity must be > 0, skipping trade")
                             import time
                             time.sleep(60)
                             continue
@@ -1211,6 +2117,8 @@ ROI: {results['roi']:.2f}%
                             
                             # Log to journal
                             self.current_trade_id = len(self.trade_journal.trades) + 1
+                            # Calculate SL price for journal entry
+                            sl_price = price * (1 - self.strategy.sl_percent / 100) if signal == 'BUY' else price * (1 + self.strategy.sl_percent / 100)
                             self.trade_journal.add_trade({
                                 'action': signal,
                                 'quantity': position_size,
@@ -1220,11 +2128,11 @@ ROI: {results['roi']:.2f}%
                             })
                             
                             # Notify
-                            self.notifications.notify_trade_entry('NQ', signal, position_size, price)
+                            contract_symbol = self.contract.symbol if self.contract and hasattr(self.contract, 'symbol') else 'MNQ'
+                            self.notifications.notify_trade_entry(contract_symbol, signal, position_size, price)
                             
                             self.log_status(f"Entry signal: {signal} {position_size} contracts at {price:.2f}")
                             self.update_position_display()
-                            self.update_risk_metrics_display()
                             
                             # Wait for order fill
                             import time
@@ -1249,8 +2157,13 @@ ROI: {results['roi']:.2f}%
                                 # Get actual position size from IBKR
                                 positions = self.ibkr.get_positions()
                                 qty_to_close = self.contract_quantity
+                                # Get contract symbol from current contract or default to MNQ
+                                target_symbol = 'MNQ'
+                                if self.contract and hasattr(self.contract, 'symbol'):
+                                    target_symbol = self.contract.symbol
+                                
                                 for pos in positions:
-                                    if hasattr(pos.contract, 'symbol') and pos.contract.symbol == 'NQ':
+                                    if hasattr(pos.contract, 'symbol') and pos.contract.symbol == target_symbol:
                                         qty_to_close = abs(pos.position)
                                         break
                                 
@@ -1259,9 +2172,6 @@ ROI: {results['roi']:.2f}%
                                 # Calculate PnL
                                 entry_price = self.strategy.entry_price
                                 pnl = (current_price - entry_price) * qty_to_close * 20 if self.strategy.position == 1 else (entry_price - current_price) * qty_to_close * 20
-                                
-                                # Update risk manager
-                                self.risk_manager.update_balance(pnl)
                                 
                                 # Update journal
                                 if self.current_trade_id:
@@ -1281,13 +2191,13 @@ ROI: {results['roi']:.2f}%
                                 })
                                 
                                 # Notify
-                                self.notifications.notify_trade_exit('NQ', 'BUY' if self.strategy.position == 1 else 'SELL', 
+                                contract_symbol = self.contract.symbol if self.contract and hasattr(self.contract, 'symbol') else 'MNQ'
+                                self.notifications.notify_trade_exit(contract_symbol, 'BUY' if self.strategy.position == 1 else 'SELL', 
                                                                     qty_to_close, entry_price, current_price, pnl, exit_signal)
                                 
                                 self.strategy.exit_position(current_price, exit_signal)
                                 self.log_status(f"Exit signal: {exit_signal} at {current_price:.2f} | PnL: ${pnl:.2f}")
                                 self.update_position_display()
-                                self.update_risk_metrics_display()
                                 self.root.after(0, self.refresh_journal)
                                 self.root.after(0, self.update_performance_metrics)
                                 
@@ -1300,22 +2210,18 @@ ROI: {results['roi']:.2f}%
                                 if exit_signal == 'TP_HIT':
                                     signal, entry_price = self.strategy.check_entry_signal(df_1h, df_10m, current_idx)
                                     if signal:
-                                        can_trade, reason = self.risk_manager.can_trade()
-                                        if can_trade:
-                                            try:
-                                                sl_price = entry_price * (1 - self.strategy.sl_percent / 100) if signal == 'BUY' else entry_price * (1 + self.strategy.sl_percent / 100)
-                                                position_size = self.risk_manager.calculate_position_size(entry_price, sl_price, contract_multiplier=20)
-                                                if position_size > 0:
-                                                    trade = self.ibkr.place_market_order(self.contract, signal, position_size)
-                                                    self.strategy.enter_position(signal, entry_price)
-                                                    self.log_status(f"Re-entry after TP: {signal} at {entry_price:.2f}")
-                                                    self.update_position_display()
-                                                    time.sleep(2)
-                                                    self.sync_positions()
-                                            except Exception as e:
-                                                self.log_status(f"Error in re-entry: {e}")
-                                        else:
-                                            self.log_status(f"Re-entry blocked: {reason}")
+                                        try:
+                                            # Use contract quantity parameter for re-entry
+                                            position_size = self.contract_quantity
+                                            if position_size > 0:
+                                                trade = self.ibkr.place_market_order(self.contract, signal, position_size)
+                                                self.strategy.enter_position(signal, entry_price)
+                                                self.log_status(f"Re-entry after TP: {signal} at {entry_price:.2f}")
+                                                self.update_position_display()
+                                                time.sleep(2)
+                                                self.sync_positions()
+                                        except Exception as e:
+                                            self.log_status(f"Error in re-entry: {e}")
                             except Exception as e:
                                 self.log_status(f"Error closing position: {e}")
                                 self.notifications.notify_error(f"Error closing position: {e}")
@@ -1449,24 +2355,6 @@ RECENT TRADES (Last 20)
             self.log_status(f"Error exporting journal: {e}")
     
     def update_risk_metrics_display(self):
-        """Update risk metrics display"""
-        try:
-            metrics = self.risk_manager.get_risk_metrics()
-            can_trade, reason = self.risk_manager.can_trade()
-            
-            status_text = f"""
-Account Balance: ${metrics['account_balance']:,.2f}
-Total PnL: ${metrics['total_pnl']:,.2f} ({metrics['total_pnl_pct']:.2f}%)
-Daily PnL: ${metrics['daily_pnl']:,.2f} ({metrics['daily_pnl_pct']:.2f}%)
-Current Drawdown: {metrics['current_drawdown']:.2f}%
-Peak Balance: ${metrics['peak_balance']:,.2f}
-Trading Status: {'✓ OK' if can_trade else '✗ BLOCKED'}
-"""
-            if not can_trade:
-                status_text += f"Reason: {reason}\n"
-            
-            color = "green" if can_trade else "red"
-            self.risk_metrics_label.configure(text=status_text.strip(), text_color=color)
-        except Exception as e:
-            self.risk_metrics_label.configure(text=f"Error: {e}", text_color="red")
+        """Update risk metrics display - removed (using simple contract quantity parameter)"""
+        pass
 

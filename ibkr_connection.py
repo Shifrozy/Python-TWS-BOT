@@ -8,6 +8,13 @@ import logging
 import time
 import asyncio
 
+# CRITICAL: Enable nested event loops for GUI thread compatibility
+try:
+    import nest_asyncio
+    nest_asyncio.apply()
+except ImportError:
+    pass  # Will work without it but may have issues in GUI context
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -210,35 +217,55 @@ class IBKRConnection:
         Returns:
             DataFrame with OHLCV data
         """
-        try:
-            # For delayed data, useRTH=False allows access to delayed data
-            # Also, endDateTime='' means current time, but for delayed data we might want past date
-            endDateTime = end_date if end_date else ''
-            
-            bars = self.ib.reqHistoricalData(
-                contract,
-                endDateTime=endDateTime,
-                durationStr=duration,
-                barSizeSetting=bar_size,
-                whatToShow='TRADES',
-                useRTH=False if use_delayed else True,  # False = delayed data, True = regular hours only
-                formatDate=1,
-                keepUpToDate=False  # Don't update in real-time for backtesting
-            )
-            
-            df = util.df(bars)
-            if df.empty:
-                logger.warning(f"No data returned for {contract.symbol} ({duration}, {bar_size})")
+        max_retries = 2
+        
+        for attempt in range(max_retries):
+            try:
+                # For delayed data, useRTH=False allows access to delayed data
+                # Also, endDateTime='' means current time, but for delayed data we might want past date
+                endDateTime = end_date if end_date else ''
+                
+                logger.info(f"Fetching {bar_size} data for {contract.symbol}, duration={duration} (attempt {attempt + 1}/{max_retries})")
+                
+                bars = self.ib.reqHistoricalData(
+                    contract,
+                    endDateTime=endDateTime,
+                    durationStr=duration,
+                    barSizeSetting=bar_size,
+                    whatToShow='TRADES',
+                    useRTH=False,  # False = include extended hours
+                    formatDate=1,
+                    keepUpToDate=False,  # Don't update in real-time for backtesting
+                    timeout=60  # 60 second timeout to prevent indefinite hang
+                )
+                
+                # Handle timeout or no data returned
+                if bars is None or len(bars) == 0:
+                    logger.warning(f"No data returned for {contract.symbol} ({duration}, {bar_size}) - attempt {attempt + 1}")
+                    if attempt < max_retries - 1:
+                        logger.info(f"Waiting 15 seconds before retry (IBKR pacing rule)...")
+                        time.sleep(15)  # IBKR requires 15 sec between identical requests
+                        continue
+                    return pd.DataFrame()
+                
+                df = util.df(bars)
+                if df is None or df.empty:
+                    logger.warning(f"Empty DataFrame for {contract.symbol} ({duration}, {bar_size})")
+                    return pd.DataFrame()
+                
+                df.set_index('date', inplace=True)
+                df.columns = [col.lower() for col in df.columns]
+                
+                logger.info(f"✓ Fetched {len(df)} bars for {contract.symbol} ({bar_size})")
+                return df[['open', 'high', 'low', 'close', 'volume']]
+                
+            except Exception as e:
+                logger.error(f"Error fetching historical data (attempt {attempt + 1}): {type(e).__name__}: {str(e)}")
+                if attempt < max_retries - 1:
+                    logger.info(f"Waiting 15 seconds before retry...")
+                    time.sleep(15)
+                    continue
                 return pd.DataFrame()
-            
-            df.set_index('date', inplace=True)
-            df.columns = [col.lower() for col in df.columns]
-            
-            logger.info(f"Fetched {len(df)} bars for {contract.symbol} ({bar_size})")
-            return df[['open', 'high', 'low', 'close', 'volume']]
-        except Exception as e:
-            logger.error(f"Error fetching historical data: {type(e).__name__}: {str(e)}")
-            return pd.DataFrame()
     
     def get_1h_data(self, contract, duration='30 D', use_delayed=True, end_date=None):
         """Get 1-hour timeframe data"""
@@ -397,4 +424,36 @@ class IBKRConnection:
         """Get account summary"""
         account_values = self.ib.accountValues()
         return {av.tag: av.value for av in account_values}
-
+    
+    def detect_available_contract(self):
+        """
+        Auto-detect which contract (NQ or MNQ) has market data subscription
+        
+        Returns:
+            tuple: (symbol, contract_object) or (None, None) if none available
+        """
+        if not self.connected or self.ib is None:
+            return None, None
+        
+        # Try MNQ first (default), then NQ
+        for symbol in ['MNQ', 'NQ']:
+            try:
+                logger.info(f"Checking market data subscription for {symbol}...")
+                # Quick contract qualification check
+                contract = self.get_contract(symbol=symbol)
+                
+                # Quick test - try to fetch minimal data (1 day)
+                logger.info(f"  Quick subscription test for {symbol}...")
+                test_data = self.get_1h_data(contract, duration='1 D', use_delayed=True)
+                
+                if test_data is not None and not test_data.empty and len(test_data) > 0:
+                    logger.info(f"✓ Market data subscription detected for {symbol} ({len(test_data)} bars available)")
+                    return symbol, contract
+                else:
+                    logger.info(f"⚠ No data available for {symbol}, trying next...")
+            except Exception as e:
+                logger.debug(f"Error checking {symbol}: {e}")
+                continue
+        
+        logger.warning("✗ No market data subscription detected for NQ or MNQ")
+        return None, None

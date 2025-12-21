@@ -42,11 +42,15 @@ def test_connection():
         print("✓ Connection successful!")
         print()
         
-        # Test contract
-        print("Step 2: Testing contract qualification...")
+        # Test contract (using continuous contract - auto rollover)
+        print("Step 2: Testing contract qualification (Continuous Contract)...")
         try:
-            contract = ibkr.get_contract()
-            print(f"✓ Contract loaded: {contract.symbol} {contract.lastTradeDateOrContractMonth}")
+            contract = ibkr.get_contract(use_continuous=True)
+            contract_month = getattr(contract, 'lastTradeDateOrContractMonth', 'Continuous')
+            print(f"✓ Contract loaded: {contract.symbol} (Continuous Contract)")
+            if contract_month != 'Continuous':
+                print(f"   Current front month: {contract_month}")
+            print("   IBKR will automatically handle contract rollover")
             print()
             
             # Test historical data

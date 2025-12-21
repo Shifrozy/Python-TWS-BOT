@@ -29,6 +29,18 @@ A Python-based trading bot for Interactive Brokers TWS that implements an EMA 20
 - ✅ Configurable Parameters (TP, SL, SuperTrend settings)
 - ✅ Live Position Tracking
 - ✅ Performance Statistics
+- ✅ **Continuous Futures Contracts** - Automatic rollover handling (Recommended)
+
+## Contract Management
+
+The bot uses **Continuous Futures Contracts** (Point 1 - Recommended approach):
+
+- ✅ **Automatic Rollover**: IBKR automatically handles contract rollover when futures expire
+- ✅ **Seamless Historical Data**: Perfect for long-duration backtests without data gaps
+- ✅ **No Manual Intervention**: No need to manually switch contracts on expiry
+- ✅ **Recommended by IBKR**: Best practice for algorithmic trading strategies
+
+The bot requests generic contract symbols (e.g., "NQ") without specific expiry months, allowing IBKR to automatically manage rollover between contract expirations. This ensures continuous data flow for both backtesting and live trading.
 
 ## Installation
 
