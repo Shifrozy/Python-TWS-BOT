@@ -1,12 +1,11 @@
-"""
-Interactive Brokers TWS Connection Module
-"""
-from ib_insync import IB, Stock, Future, util
-import pandas as pd
-from datetime import datetime, timedelta
-import logging
-import time
 import asyncio
+
+# CRITICAL: Ensure an asyncio event loop is set on the current thread before importing ib_insync / eventkit
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    _loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(_loop)
 
 # CRITICAL: Enable nested event loops for GUI thread compatibility
 try:
@@ -14,6 +13,12 @@ try:
     nest_asyncio.apply()
 except ImportError:
     pass  # Will work without it but may have issues in GUI context
+
+from ib_insync import IB, Stock, Future, util
+import pandas as pd
+from datetime import datetime, timedelta
+import logging
+import time
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
